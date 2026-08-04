@@ -16,6 +16,8 @@
   - 保留 Pi 标准的输出截断和错误处理行为。
 - `agent/AGENTS.md`
   - 当前 `~/.pi/agent/AGENTS.md` 的归档副本，保留 Pi Agent 的规则、术语和扩展清单。
+- `extensions/AGENTS.md`
+  - 只适用于本仓库 `extensions/` 目录的精简规则文件，记录两个扩展的范围、修改约束和验证方式。
 
 ## 安装
 
@@ -76,6 +78,7 @@ tsc -p "$HOME\.pi\agent\extensions\tsconfig.json"
 ```text
 pi-extensions/
 ├─ extensions/
+│  ├─ AGENTS.md
 │  ├─ auto-summary.ts
 │  └─ powershell-bash.ts
 ├─ agent/
