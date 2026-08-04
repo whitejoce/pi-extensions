@@ -1,0 +1,14 @@
+# Generated files and local dependencies
+node_modules/
+*.log
+
+# Local secrets and credentials
+auth.json
+.env
+.env.*
+
+# Editor and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
