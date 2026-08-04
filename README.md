@@ -1,6 +1,6 @@
 # Pi Agent Summary & Permission Extensions
 
-面向 [Pi](https://github.com/badlogic/pi-mono) 的两个扩展，以及当前 `~/.pi/agent/AGENTS.md` 规则文件的整理归档。
+面向 [Pi](https://github.com/earendil-works/pi) 的两个扩展，以及当前 `~/.pi/agent/AGENTS.md` 规则文件的整理归档。
 
 ## 包含内容
 
