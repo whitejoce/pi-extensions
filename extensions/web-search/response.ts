@@ -1,4 +1,4 @@
-import type { FetchResult, SearchResult } from "./client.js";
+import type { FetchResult } from "./types.js";
 
 export class ApiError extends Error {
   constructor(readonly status: number, message: string, readonly requestId?: string) {
@@ -60,22 +60,6 @@ export async function responseText(response: Response, signal: AbortSignal): Pro
 
 const object = (value: unknown): value is Record<string, unknown> =>
   !!value && typeof value === "object" && !Array.isArray(value);
-
-export function searchResults(value: unknown): SearchResult[] {
-  if (!object(value) || !Array.isArray(value.results)) throw new ApiError(502, "Invalid web-search results response");
-  if (value.results.length > 100) throw new ApiError(502, "Too many web-search results");
-  return value.results.map((row: unknown) => {
-    if (!object(row) || !["title", "url", "snippet", "summary"].every(key => typeof row[key] === "string") ||
-      typeof row.rerank_score !== "number" || !Number.isFinite(row.rerank_score) ||
-      !Number.isInteger(row.authority) || (row.site_name != null && typeof row.site_name !== "string") ||
-      (row.date != null && typeof row.date !== "string")) throw new ApiError(502, "Invalid web-search result fields");
-    try { validateUrl(row.url as string); }
-    catch { throw new ApiError(502, "Invalid URL in web-search results"); }
-    return { rerank_score: row.rerank_score, authority: row.authority as number, title: row.title as string,
-      url: row.url as string, snippet: row.snippet as string, summary: row.summary as string,
-      site_name: row.site_name as string | null ?? null, date: row.date as string | null ?? null };
-  });
-}
 
 export function fetchResult(value: unknown): FetchResult {
   if (!object(value) || typeof value.title !== "string" || typeof value.content !== "string") {

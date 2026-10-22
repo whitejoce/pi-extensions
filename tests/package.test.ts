@@ -37,7 +37,8 @@ try {
     cwd, agentDir, settingsManager: SettingsManager.inMemory({ packages: [relocated] }),
   });
   const resources = await manager.resolve();
-  const skills = resources.skills.filter((entry) => entry.enabled);
+  // Pi also discovers personal skills outside agentDir (for example ~/.agents).
+  const skills = resources.skills.filter((entry) => entry.enabled && entry.metadata.packageRoot === relocated);
   assert.equal(skills.length, 1, "the package exposes exactly the upgrade-review skill");
   const skillPath = skills[0].path;
   const skillDirectory = skillPath.endsWith("SKILL.md") ? resolve(skillPath, "..") : skillPath;

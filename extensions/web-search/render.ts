@@ -120,20 +120,20 @@ export function buildSearchLines(details: SearchDetails, theme: ThemeLike, opts:
   return (width: number) => {
     const W = width > 40 ? width : DEFAULT_WIDTH;
     const { results, mirrors } = details;
-    const scores = results.map((r) => r.rerank_score);
-    const auths = results.map((r) => r.authority);
-    const legend = results.length
+    const scores = results.map((r) => r.rerank_score).filter((s): s is number => s !== null);
+    const auths = results.map((r) => r.authority).filter((s): s is number => s !== null);
+    const legend = scores.length && auths.length
       ? ` · 相关度 ${Math.min(...scores).toFixed(1)}–${Math.max(...scores).toFixed(1)} · 权威 ${Math.min(...auths)}–${Math.max(...auths)}`
       : "";
     const headerText =
       `┌─ web_search · ${results.length} 条${legend} · ` +
-      `¥${details.cached ? "0.000" : details.costCny.toFixed(3)}` +
+      (details.costCny === null ? "cost unknown" : `¥${details.cached ? "0.000" : details.costCny.toFixed(3)}`) +
       (details.cached ? theme.fg("success", " · cached") : "") +
       (details.ms ? ` · ${(details.ms / 1000).toFixed(1)}s` : "");
     const rows: string[] = [headerText + theme.fg("border", "─".repeat(Math.max(0, W - stripAnsi(headerText).length)))];
 
     if (results.length === 0) {
-      rows.push(theme.fg("border", "│ ") + theme.fg("dim", "无结果（空结果不计费）。建议：调整关键词 · 去掉 site: 限定 · 尝试英文查询"));
+      rows.push(theme.fg("border", "│ ") + theme.fg("dim", "无结果。建议：调整关键词 · 去掉 site: 限定 · 尝试英文查询"));
       rows.push(theme.fg("border", "└" + "─".repeat(W - 2)));
       return rows;
     }
@@ -145,9 +145,9 @@ export function buildSearchLines(details: SearchDetails, theme: ThemeLike, opts:
         rows.push(
           theme.fg("border", "│ ") +
             theme.fg("muted", `${i + 1}. `) +
-            theme.fg(scoreToken(r.rerank_score), r.rerank_score.toFixed(1)) +
+            theme.fg(r.rerank_score === null ? "muted" : scoreToken(r.rerank_score), r.rerank_score?.toFixed(1) ?? "N/A") +
             theme.fg("muted", " ¶") +
-            theme.fg(r.authority >= 3 ? "success" : "muted", `${r.authority}`) +
+            theme.fg((r.authority ?? -1) >= 3 ? "success" : "muted", `${r.authority ?? "N/A"}`) +
             "  " +
             theme.bold(truncateToWidth(r.title, 46)) +
             mirror +
@@ -169,8 +169,8 @@ export function buildSearchLines(details: SearchDetails, theme: ThemeLike, opts:
         const datePart = rel && rel !== iso ? `${iso}（${rel}）` : rel || iso;
         const sep = theme.fg("dim", " · ");
         const meta = [
-          theme.fg("muted", "   相关 ") + theme.fg(scoreToken(r.rerank_score), `${r.rerank_score.toFixed(2)}/3`),
-          theme.fg("muted", "权威 ") + theme.fg(r.authority >= 3 ? "success" : "muted", `${r.authority}/4`),
+          theme.fg("muted", "   相关 ") + theme.fg(r.rerank_score === null ? "muted" : scoreToken(r.rerank_score), r.rerank_score === null ? "N/A" : `${r.rerank_score.toFixed(2)}/3`),
+          theme.fg("muted", "权威 ") + theme.fg((r.authority ?? -1) >= 3 ? "success" : "muted", r.authority === null ? "N/A" : `${r.authority}/4`),
           site ? theme.fg("accent", site) : "",
           datePart ? theme.fg("dim", datePart) : "",
         ]
@@ -191,10 +191,10 @@ export function buildSearchLines(details: SearchDetails, theme: ThemeLike, opts:
 /** Model-facing plain text: numbered results with score/authority, URL, and summary. */
 export function searchContent(details: SearchDetails): string {
   if (details.results.length === 0) {
-    return `Web search "${details.query}" returned no results (not billed). Try different keywords, drop site: filters, or search in English.`;
+    return `Web search "${details.query}" returned no results. Try different keywords, drop site: filters, or search in English.`;
   }
   const lines: string[] = [
-    `Web search: "${details.query}" — ${details.results.length} results (score/authority; score ≥ 1.5 is high quality, authority ≥ 3 is highly authoritative):`,
+    `Web search: "${details.query}" — ${details.results.length} results (N/A means the provider did not supply a score; score/authority; score ≥ 1.5 is high quality, authority ≥ 3 is highly authoritative):`,
     "",
   ];
   for (const [i, r] of details.results.entries()) {
@@ -202,7 +202,7 @@ export function searchContent(details: SearchDetails): string {
     const date = fmtDate(r.date);
     const mirror = details.mirrors[i] ? ` (mirror of #${details.mirrors[i]})` : "";
     lines.push(
-      `${i + 1}. [${r.rerank_score.toFixed(2)}/${r.authority}] ${r.title} — ${site}${date ? ` · ${date}` : ""}${mirror}`,
+      `${i + 1}. [${r.rerank_score?.toFixed(2) ?? "N/A"}/${r.authority ?? "N/A"}] ${r.title} — ${site}${date ? ` · ${date}` : ""}${mirror}`,
       `   ${r.url}`,
       `   ${cleanTroff(r.summary).slice(0, 600)}`,
       "",
@@ -219,7 +219,7 @@ export interface FetchDetails {
   offset: number;
   length: number;
   text: string;
-  costCny: number;
+  costCny: number | null;
 }
 
 export const FETCH_PAGE_CHARS = 20_000;
@@ -243,7 +243,8 @@ export function buildFetchLines(details: FetchDetails, theme: ThemeLike): (width
     const W = width > 40 ? width : DEFAULT_WIDTH;
     const lines = details.text.split(/\r?\n/).filter((l) => l.trim());
     const shown = lines.slice(0, 12);
-    const headerText = `┌─ web_fetch · ${truncateToWidth(stripScheme(details.url), 42)} · ${details.totalChars} chars · ¥${details.costCny.toFixed(3)}`;
+    const cost = details.costCny === null ? "cost unknown" : `¥${details.costCny.toFixed(3)}`;
+    const headerText = `┌─ web_fetch · ${truncateToWidth(stripScheme(details.url), 42)} · ${details.totalChars} chars · ${cost}`;
     const rows = [headerText + theme.fg("border", "─".repeat(Math.max(0, W - stripAnsi(headerText).length)))];
     for (const l of shown) rows.push(theme.fg("border", "│ ") + truncateToWidth(l, W - 4));
     if (lines.length > shown.length) {

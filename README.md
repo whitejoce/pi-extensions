@@ -13,11 +13,11 @@
 | `notify-dot` | 用标题标记提示完成、出错或等待确认，支持焦点清除及 `/notifydiag` 诊断。 |
 | `ai-rename` | `/n` 自动生成会话名称，或直接设置名称。 |
 | `permission-gate` | 拦截敏感文件访问，对危险命令请求确认，提权调用每次单独确认就绪。 |
-| `web-search` | 提供搜索、网页分页和 `/websearch` 直接查询。 |
+| `web-search` | 支持 DeepSeek / AnySearch 搜索，默认优先 DeepSeek、无凭据时选择已配置的 AnySearch；支持网页分页和 `/websearch` 直接查询。 |
 | `write-transforms` | 增强 `read/edit/write`：读取版本约束、保守匹配与写后校验。 |
 | `plugin-manager` | `/plugins` 管理 Global/Project 扩展开关，保存后应用原生重载。 |
 
-各扩展的详细用法、配置、费用与行为边界见 [扩展详细说明](docs/extensions.md)。
+各扩展的详细用法、配置、费用与行为边界见 [扩展详细说明](docs/extensions.md)。搜索渠道扩展开发见 [Provider 适配器架构](docs/search-providers.md)。
 
 技能 [`pi-upgrade-review`](skills/pi-upgrade-review/SKILL.md) 通过 `/skill:pi-upgrade-review` 手动审查 Pi 升级对本地扩展的影响，生成有版本号的报告。调用本身不授权修改扩展。
 
@@ -54,9 +54,12 @@ pi update git:github.com/whitejoce/pi-extensions
 /summary [可选整理要求]
 /anim [可选样式 comet|wave|chase|random]
 /n [可选名字]
+/websearch
+/websearch setup
+/websearch provider [auto|deepseek|anysearch]
+/websearch status
 /websearch <query>
 /websearch fetch <n|url>
-/websearch status
 /harness tools
 /harness execution [操作ID]
 /notifydiag
@@ -69,7 +72,8 @@ pi update git:github.com/whitejoce/pi-extensions
 - `/summary` 无参数时保存最近一次助手文本回复；带参数时调用当前模型生成文档。已有会话名时直接复用；未命名时先调用模型生成标题，保存成功后设置会话名。文件保存在当前工作目录，使用 `-vN.md` 避免覆盖。
 - `/anim` 无参数时选择样式，带参数时直接设置；压缩动画会自动显示。
 - `/n` 带名字时直接设置，单独执行时调用当前模型生成名称。
-- `/websearch` 直接调用 DeepSeek Search API；模型也可以使用 `web_search` / `web_fetch` 工具。
+- `/websearch` 是统一入口：已有凭据时显示状态与可选连接测试，无凭据时提供邮箱快速开始、已有密钥和高级设置。`/websearch setup` 也打开此入口；高级设置提供渠道选择、隐藏密钥输入，以及经确认的 AnySearch 邮箱注册取钥；保存后立即生效。`/websearch provider` 打开策略菜单，`/websearch status` 显示渠道、原因与凭据状态。
+- `/websearch` 按配置直接调用 DeepSeek Search API 或 AnySearch；模型也可以使用 `web_search` / `web_fetch` 工具。
 - `/plugins` 在一张表中编辑 Global 默认与 Project 覆盖，Ctrl+R 恢复继承，Ctrl+S 保存两列并关闭界面、重载资源。工具启用由 Pi 原生处理，详见 [扩展管理](docs/extensions.md#plugin-manager)。
 - `/skill:pi-upgrade-review` 读取本地升级记录、核对当前扩展与公开 API，并运行适用的现有离线检查；报告默认归档到实际 Pi agent 目录的 `docs/pi-upgrade-reviews/`，与包代码分开。
 

@@ -1,8 +1,8 @@
 /**
- * DeepSeek Search/Fetch API client for the web-search extension.
+ * DeepSeek/AnySearch Search/Fetch API client for the web-search extension.
  *
- * Billing: 5 CNY per 1000 successful calls (0.005/call); failed and empty
- * results are not billed. Retries follow the documented policy: 408/429/5xx
+ * DeepSeek billing: 5 CNY per 1000 successful calls (0.005/call); AnySearch
+ * pricing is unknown and never generates a fictional expense. Retries: 408/429/5xx
  * are retried with backoff, other 4xx are not.
  *
  * Credentials resolution (first hit wins):
@@ -11,54 +11,27 @@
  *   3. pi's auth.json `deepseek` entry (readStoredCredential)
  * The API key is never included in errors, logs, or tool details.
  */
-import { readFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
-import { join } from "node:path";
-import { fileURLToPath } from "node:url";
-import { setTimeout as delay } from "node:timers/promises";
-import { getAgentDir, readStoredCredential } from "@earendil-works/pi-coding-agent";
-import { ApiError, validateUrl, responseText, searchResults, fetchResult } from "./response.js";
+import { ApiError, validateUrl } from "./response.js";
+import { readConfigEnvFile, selectProvider, type CredentialReader } from "./configuration.js";
+import type { ProviderMode } from "./registry.js";
+import type { SearchAdapter, ProviderRequest } from "./provider.js";
+import { JsonTransport } from "./transport.js";
+import type { FetchResult, SearchDetails } from "./types.js";
 export { ApiError, validateUrl } from "./response.js";
+export { PRICE_PER_CALL_CNY } from "./providers/deepseek.js";
+export { parseEnvText, readExtEnvFile, readConfigEnvFile, resolveCredentials } from "./configuration.js";
+export type { SearchProvider, ProviderMode } from "./registry.js";
+export type { SearchResult, FetchResult, SearchDetails } from "./types.js";
 
-export const PRICE_PER_CALL_CNY = 0.005;
-const DEFAULT_BASE_URL = "https://api.deepseek.com";
 const DEFAULT_DAILY_LIMIT = 300;
-const AUTH_PROVIDER_ID = "deepseek";
-const REQUEST_TIMEOUT_MS = 90_000;
-const RETRY_DELAYS_MS = [500, 1000];
 const CACHE_TTL_MS = 10 * 60_000;
 const CACHE_MAX_ENTRIES = 50;
 const CACHE_MAX_BYTES = 16 * 1024 * 1024;
 
-export interface SearchResult {
-  rerank_score: number;
-  authority: number;
-  title: string;
-  url: string;
-  snippet: string;
-  summary: string;
-  site_name: string | null;
-  date: string | null;
-}
-
-export interface FetchResult {
-  title: string;
-  content: string;
-}
-
-export interface SearchDetails {
-  query: string;
-  count: number;
-  results: SearchResult[];
-  /** mirrors[i] = 1-based index of the first result with the same page identity, 0 if not a duplicate. */
-  mirrors: number[];
-  ms: number;
-  cached: boolean;
-  costCny: number;
-}
-
 export interface ClientStats {
   billed: number;
+  estimatedCostCny: number | null;
   cacheHits: number;
   retries: number;
   lastError: string | null;
@@ -72,57 +45,9 @@ export interface ServiceCharge { id: string; kind: "search" | "fetch"; amountCny
 /** Daily call limit reached; the message is model- and user-facing. */
 export class LimitError extends Error {
   constructor(limit: number) {
-    super(`web-search daily limit reached (${limit} billed or pending calls in this Pi process). Raise PI_WEBSEARCH_DAILY_LIMIT or retry tomorrow.`);
+    super(`web-search daily limit reached (${limit} successful nonempty or pending calls in this Pi process). Raise PI_WEBSEARCH_DAILY_LIMIT or retry tomorrow.`);
     this.name = "LimitError";
   }
-}
-
-/** Parse KEY=VALUE lines; `#` starts a comment (also after an unquoted value), blank lines are skipped. */
-export function parseEnvText(text: string): Record<string, string> {
-  const out: Record<string, string> = {};
-  for (const line of text.split(/\r?\n/)) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith("#")) continue;
-    const eq = trimmed.indexOf("=");
-    if (eq <= 0) continue;
-    let value = trimmed.slice(eq + 1).trim();
-    if (!value.startsWith('"') && !value.startsWith("'")) {
-      const hash = value.indexOf(" #");
-      if (hash >= 0) value = value.slice(0, hash).trim();
-    }
-    out[trimmed.slice(0, eq).trim()] = value;
-  }
-  return out;
-}
-
-function readEnvPath(path: string): Record<string, string> {
-  try {
-    return parseEnvText(readFileSync(path, "utf-8"));
-  } catch {
-    return {};
-  }
-}
-
-/** Legacy configuration for manual installs. */
-export function readExtEnvFile(): Record<string, string> {
-  return readEnvPath(fileURLToPath(new URL(".env", import.meta.url)));
-}
-
-/** Personal configuration stays outside the checkout managed by Pi updates. */
-export function readConfigEnvFile(
-  userPath = join(getAgentDir(), "config", "pi-extensions", ".env.web-search"),
-  legacyPath = fileURLToPath(new URL(".env", import.meta.url)),
-): Record<string, string> {
-  const legacy = readEnvPath(legacyPath);
-  const user = readEnvPath(userPath);
-  const key = user.api_key ?? user.apikey;
-  const baseUrl = user.base_url ?? user.baseUrl;
-  return {
-    ...legacy,
-    ...user,
-    ...(key !== undefined ? { api_key: key } : {}),
-    ...(baseUrl !== undefined ? { base_url: baseUrl } : {}),
-  };
 }
 
 /** Session cache with TTL, entry count and an approximate UTF-16 byte budget. */
@@ -164,31 +89,32 @@ class TtlCache<T> {
 /** TTL cache for exact query+count repeats; hits cost nothing. */
 export class SearchCache extends TtlCache<SearchDetails> {}
 
-const statusMessage: Record<number, string> = {
-  402: "DeepSeek account balance insufficient (402): top up at the DeepSeek platform, then retry.",
-  429: "Rate limited (429): retrying with backoff.",
-};
-
-function isRetryable(status: number): boolean {
-  return status === 408 || status === 429 || status >= 500;
-}
-
 export interface ClientOptions {
+  provider?: ProviderMode;
   baseUrl?: string;
   apiKey?: string;
   dailyLimit?: number;
   fetchImpl?: typeof fetch;
   now?: () => number;
   /** Credential reader override; defaults to pi's readStoredCredential. */
-  readCredential?: (providerId: string) => { type: string; key?: string } | undefined;
+  readCredential?: CredentialReader;
+  /** Registry injection for offline adapter contract tests, not runtime discovery. */
+  adapters?: readonly SearchAdapter[];
   /** File configuration override; defaults to personal config over legacy extension .env. */
   readEnvFile?: () => Record<string, string>;
 }
 
 export class SearchClient {
+  verified = false;
+  get configured(): boolean { return this.apiKey.length > 0; }
+  readonly provider: string;
+  readonly providerMode: ProviderMode;
+  readonly selectionReason: string;
+  readonly selectionReasonCode: "explicit" | "preferred" | "fallback" | "missing";
   readonly baseUrl: string;
   private readonly apiKey: string;
-  private readonly fetchImpl: typeof fetch;
+  private readonly adapter: SearchAdapter;
+  private readonly transport: JsonTransport;
   private readonly now: () => number;
   /** Where the active key came from: "file" | "auth.json". */
   readonly credentialSource: "file" | "auth.json" | undefined;
@@ -196,23 +122,38 @@ export class SearchClient {
   private pages: TtlCache<FetchResult>;
   private daily?: { day: string; billed: number; pending: number };
   private billed = 0;
+  private knownCostCny = 0;
   private cacheHits = 0;
   private retries = 0;
   private lastError: string | null = null;
   private chargeListeners = new Set<(charge: ServiceCharge) => void>();
 
   constructor(opts: ClientOptions = {}) {
-    const env = resolveCredentials(opts.readCredential, opts.readEnvFile);
-    this.baseUrl = (opts.baseUrl ?? env.baseUrl ?? DEFAULT_BASE_URL).replace(/\/+$/, "");
+    let config: Record<string, string>;
+    try { config = (opts.readEnvFile ?? readConfigEnvFile)(); }
+    catch { config = {}; }
+    const mode = opts.provider ?? config.provider ?? "auto";
+    const selection = selectProvider(mode, config, opts.readCredential, opts.apiKey, opts.adapters);
+    this.providerMode = mode as ProviderMode;
+    this.selectionReason = selection.reason;
+    this.selectionReasonCode = selection.reasonCode;
+    this.adapter = selection.adapter;
+    this.provider = this.adapter.id;
+    const env = selection.credentials;
+    this.baseUrl = (opts.baseUrl ?? env.baseUrl ?? this.adapter.defaultBaseUrl).replace(/\/+$/, "");
+    const endpoint = validateUrl(this.baseUrl);
+    if (this.adapter.requireHttps && endpoint.protocol !== "https:") throw new ApiError(400, `${this.adapter.label} requires an HTTPS base_url`);
     this.apiKey = opts.apiKey ?? env.apiKey ?? "";
     this.credentialSource = env.source === "file" || env.source === "auth.json" ? env.source : undefined;
     this.dailyLimit = opts.dailyLimit ?? resolveDailyLimit();
-    this.fetchImpl = opts.fetchImpl ?? fetch;
+    this.transport = new JsonTransport(this.adapter, this.baseUrl, opts.fetchImpl ?? fetch, () => { this.retries++; });
     this.now = opts.now ?? Date.now;
     this.cache = new SearchCache(CACHE_TTL_MS, CACHE_MAX_ENTRIES, this.now);
     this.pages = new TtlCache(CACHE_TTL_MS, CACHE_MAX_ENTRIES, this.now);
     if (!this.apiKey) {
-      this.lastError = "no API key: config/pi-extensions/.env.web-search, legacy web-search/.env or a deepseek api_key credential in auth.json";
+      this.lastError = mode === "auto"
+        ? "no search API key: configure a search provider in config/pi-extensions/.env.web-search"
+        : `no ${this.adapter.label} API key: set ${this.adapter.credentials.keyFields[0]} in config/pi-extensions/.env.web-search`;
     }
   }
 
@@ -220,7 +161,8 @@ export class SearchClient {
 
   stats(): ClientStats {
     const today = this.today();
-    return { billed: this.billed, cacheHits: this.cacheHits, retries: this.retries, lastError: this.lastError,
+    const unknownPrice = this.adapter.priceCny.search === null || (!!this.adapter.fetch && this.adapter.priceCny.fetch === null);
+    return { billed: this.billed, estimatedCostCny: unknownPrice ? null : this.knownCostCny, cacheHits: this.cacheHits, retries: this.retries, lastError: this.lastError,
       dailyLimit: this.dailyLimit, dailyBilled: today.billed, dailyPending: today.pending, day: today.day };
   }
 
@@ -236,8 +178,12 @@ export class SearchClient {
 
   private charge(kind: ServiceCharge["kind"]): void {
     this.billed++;
-    const charge = { id: randomUUID(), kind, amountCny: PRICE_PER_CALL_CNY };
-    for (const listener of this.chargeListeners) listener(charge);
+    const price = this.adapter.priceCny[kind];
+    if (price !== null) {
+      this.knownCostCny += price;
+      const charge = { id: randomUUID(), kind, amountCny: price };
+      for (const listener of this.chargeListeners) listener(charge);
+    }
   }
 
   private today() {
@@ -261,70 +207,21 @@ export class SearchClient {
       if (charged) bucket.billed++;
     };
   }
-  private async request(path: string, body: unknown, signal?: AbortSignal): Promise<unknown> {
-    const deadline = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
-    const requestSignal = signal ? AbortSignal.any([deadline, signal]) : deadline;
-    let lastErr: ApiError = new ApiError(500, "unreachable");
+  private async request(request: ProviderRequest, signal?: AbortSignal): Promise<unknown> {
     try {
-      for (let attempt = 0; attempt <= RETRY_DELAYS_MS.length; attempt++) {
-        requestSignal.throwIfAborted();
-        if (attempt > 0) {
-          await delay(RETRY_DELAYS_MS[attempt - 1], undefined, { signal: requestSignal });
-          requestSignal.throwIfAborted();
-          this.retries++;
-        }
-        let res: Response;
-        try {
-          res = await this.fetchImpl(`${this.baseUrl}${path}`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json", Authorization: `Bearer ${this.apiKey}` },
-            body: JSON.stringify(body),
-            signal: requestSignal,
-          });
-        } catch (e) {
-          requestSignal.throwIfAborted();
-          lastErr = new ApiError(504, `network error: ${(e as Error).message}`);
-          continue;
-        }
-        requestSignal.throwIfAborted();
-        const text = await responseText(res, requestSignal);
-        if (res.ok) {
-          let value: unknown;
-          try { value = JSON.parse(text); }
-          catch { throw new ApiError(502, "web-search response is not valid JSON"); }
-          requestSignal.throwIfAborted();
-          this.lastError = null;
-          return value;
-        }
-        requestSignal.throwIfAborted();
-        let message = text;
-        let requestId: string | undefined;
-        try {
-          const parsed = JSON.parse(text) as { error?: { message?: string; type?: string }; request_id?: string };
-          message = parsed.error?.message ?? message;
-          requestId = parsed.request_id;
-        } catch {
-          /* keep raw text */
-        }
-        lastErr = new ApiError(res.status, statusMessage[res.status] ?? `${message} (HTTP ${res.status})`, requestId);
-        if (!isRetryable(res.status)) break;
-      }
-      this.lastError = lastErr.message;
-      throw lastErr;
+      const value = await this.transport.request(request, signal);
+      this.lastError = null;
+      return value;
     } catch (error) {
-      // User/session cancellation is terminal, including while reading a body or backing off.
       signal?.throwIfAborted();
-      if (deadline.aborted) {
-        const expired = new ApiError(504, "web-search request timed out");
-        this.lastError = expired.message;
-        throw expired;
-      }
+      if (error instanceof ApiError) this.lastError = error.message;
       throw error;
     }
   }
 
   async search(query: string, count = 5, signal?: AbortSignal): Promise<SearchDetails> {
     signal?.throwIfAborted();
+    if (!Number.isInteger(count) || count < 1 || count > 10) throw new ApiError(400, "Search count must be an integer from 1 to 10");
     const key = `${count}\u0000${query}`;
     const cache = this.cache;
     const hit = cache.get(key);
@@ -335,9 +232,11 @@ export class SearchClient {
     const settle = this.reserve();
     try {
       const t0 = this.now();
-      const body = await this.request("/v1/tools/search", { query, count, need_content: false }, signal);
+      const body = await this.request(this.adapter.search.request(query, count, this.apiKey), signal);
       signal?.throwIfAborted();
-      const results = searchResults(body);
+      const results = this.adapter.search.parse(body);
+      this.verified = true;
+      const price = this.adapter.priceCny.search;
       const details: SearchDetails = {
         query,
         count,
@@ -345,7 +244,7 @@ export class SearchClient {
         mirrors: mirrorOf(results),
         ms: this.now() - t0,
         cached: false,
-        costCny: results.length ? PRICE_PER_CALL_CNY : 0,
+        costCny: price === null ? null : results.length ? price : 0,
       };
       if (results.length > 0) {
         settle(true);
@@ -356,15 +255,19 @@ export class SearchClient {
     } finally { settle(false); }
   }
 
-  async fetchPage(url: string, signal?: AbortSignal): Promise<FetchResult & { costCny: number }> {
+  async fetchPage(url: string, signal?: AbortSignal): Promise<FetchResult & { costCny: number | null }> {
     signal?.throwIfAborted();
     validateUrl(url);
+    const fetchAdapter = this.adapter.fetch;
+    if (!fetchAdapter) throw new ApiError(501, `${this.adapter.label} does not support page extraction`);
     const cache = this.pages;
     const hit = cache.get(url);
     if (hit) { this.cacheHits++; return { ...hit, costCny: 0 }; }
     const settle = this.reserve();
     try {
-      const body = fetchResult(await this.request("/v1/tools/fetch", { url }, signal));
+      const value = await this.request(fetchAdapter.request(url, this.apiKey), signal);
+      const body = fetchAdapter.parse(value);
+      this.verified = true;
       signal?.throwIfAborted();
       const billable = body.content.trim().length > 0;
       if (billable) {
@@ -372,7 +275,8 @@ export class SearchClient {
         this.charge("fetch");
         cache.set(url, body);
       }
-      return { ...body, costCny: billable ? PRICE_PER_CALL_CNY : 0 };
+      const price = this.adapter.priceCny.fetch;
+      return { ...body, costCny: price === null ? null : billable ? price : 0 };
     } finally { settle(false); }
   }
 }
@@ -402,36 +306,6 @@ export function mirrorOf(results: { title: string; url: string }[]): number[] {
   });
 }
 
-
-/** Resolve credentials: personal config > legacy extension .env > Pi deepseek credential. */
-export function resolveCredentials(
-  readCred: (providerId: string) => { type: string; key?: string } | undefined = (id) => {
-    try {
-      return readStoredCredential(id);
-    } catch {
-      return undefined;
-    }
-  },
-  readEnvFile: () => Record<string, string> = readConfigEnvFile,
-): { apiKey?: string; baseUrl?: string; source: "file" | "auth.json" | "none" } {
-  let stored: { type: string; key?: string } | undefined;
-  try {
-    stored = readCred(AUTH_PROVIDER_ID);
-  } catch {
-    stored = undefined; // a corrupt or unreadable store must not break the extension
-  }
-  const storedKey = stored?.type === "api_key" ? stored.key : undefined;
-  let file: Record<string, string>;
-  try {
-    file = readEnvFile();
-  } catch {
-    file = {};
-  }
-  const fileKey = file.api_key ?? file.apikey;
-  const apiKey = fileKey ?? storedKey;
-  const baseUrl = file.base_url ?? file.baseUrl;
-  return { apiKey, baseUrl, source: fileKey ? "file" : storedKey ? "auth.json" : "none" };
-}
 
 function resolveDailyLimit(env: Record<string, string | undefined> = process.env): number {
   const raw = env.PI_WEBSEARCH_DAILY_LIMIT;

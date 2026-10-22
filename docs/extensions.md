@@ -112,6 +112,54 @@ api_key=填写你自己的密钥
 
 也可以参照 [配置示例](web-search.env.example)。如果已有 Pi 的 `deepseek` API key 且使用默认服务地址，无需另建文件。配置读取不会自动创建、迁移或覆盖文件；修改配置后执行 `/reload` 或重启 Pi。
 
+### 交互配置与新手接入
+
+无需手工编辑配置文件，在 Pi 交互终端运行：
+
+```text
+/websearch setup
+/websearch provider
+/websearch status
+```
+
+首次使用只需输入 `/websearch`（`setup` 为同一入口）。已有凭据时直接显示当前状态，不要求重复配置；无凭据时提供“邮箱快速开始（推荐）/ 我已有 API Key / 高级设置”。推荐路径默认使用自动策略，直接输入邮箱、确认注册与保存；完成后可选择测试搜索或稍后再试，测试可能消耗额度，不会自动执行。高级设置保留“自动（优先 DeepSeek）/ DeepSeek / AnySearch”与渠道配置。已有 API Key 时使用专用隐藏输入界面，支持粘贴与 Esc 取消；只显示星号，不使用普通对话输入，也不会把密钥写入会话记录。确认后密钥以明文保存在个人配置文件，POSIX 新文件权限为 0600，Windows 使用目录继承权限；这不是加密凭据库，请保护个人目录。
+
+AnySearch 还提供“使用真实邮箱注册并获取 API Key”选项：输入邮箱，明确确认将其发送至官方服务、创建账号及本地保存密钥后，只发送一次注册请求。成功后安全保存取回的密钥并立即应用，默认策略仍优先 DeepSeek。新注册密钥只用于 AnySearch 官方地址，不继承旧代理地址。邮箱已注册时引导官网登录获取密钥，不会重复注册；如果网络中断、取消或密钥保存失败，账号可能已创建，应先去官网登录确认，不自动重试或换号。
+
+`provider` 打开策略选择菜单，也可用 `/websearch provider auto|deepseek|anysearch` 直接切换。保存立即生效，取消旧请求并清空旧渠道缓存和上一轮结果，不需要 `/reload`。界面取消或配置发生并发变更时不覆盖现有文件。`status` 默认只显示是否配置/验证、当前渠道、原因与下一步；`status --verbose` 才显示用量、限额和错误诊断。`help` 只提供本地帮助，不发送搜索请求。状态同时说明当前策略、实际渠道、选择原因，以及各渠道“已配置/未配置”的凭据状态，不显示密钥或其前缀；“已配置”不代表服务端已经验证有效。
+
+密钥输入和注册仅在 Pi 交互终端中开放，RPC/无界面模式不会回退到明文密钥输入。不要把密钥作为 `/websearch setup` 的命令参数。手动编辑文件的方式仍受支持，手动修改后需 `/reload` 或重启。
+
+### AnySearch 渠道
+
+同一个扩展支持 DeepSeek 与 AnySearch，不需要额外安装搜索插件。工具名、分页、缓存、取消与 `/websearch` 命令保持不变。默认 `provider=auto`：优先使用已配置的 DeepSeek 密钥（含 Pi 保存的 API key），没有时使用已配置的 AnySearch 密钥；两个都没有时明确提示配置。只配置 AnySearch 密钥即可自动使用，不必指定渠道。示例：
+
+```dotenv
+provider=auto
+anysearch_api_key=填写你自己的AnySearch密钥
+# 可选；默认即为下面的官方地址，只能使用 HTTPS
+anysearch_base_url=https://api.anysearch.com
+```
+
+- 不配置 `provider` 等同于 `provider=auto`；两个渠道都有凭据时始终优先 DeepSeek。空白密钥不算已配置。显式 `provider=deepseek` 或 `provider=anysearch` 可以固定渠道；缺少该渠道密钥时直接报错，不偷偷换渠道。未知渠道会报告配置错误。
+- 自动选择只在创建或重载客户端时根据凭据进行，不会在 DeepSeek 请求失败、额度不足或密钥无效时把查询发送给 AnySearch；如需切换，使用者明确修改渠道。`/websearch status` 显示模式、实际渠道及选择原因。
+- AnySearch 使用独立的密钥和地址字段，不读取 `api_key`、`base_url` 或 Pi 的 DeepSeek 凭据，避免跨服务发送密钥；本适配要求配置密钥，不自动注册账号或回退匿名模式。
+- 搜索调用 `POST /v1/search`，把 `count` 映射到 `max_results`（1–10）；网页正文调用 `POST /v1/extract`。处理官方 `code/data` 响应封装，摘要缺失时使用截断的 `content`。首版仅提供通用搜索，不暴露垂直领域参数。
+- AnySearch 不提供 DeepSeek 的相关度和权威评分，对应结构化字段为 `null`，界面显示 `N/A`，不伪造评分。此字段变化只影响 AnySearch 渠道；DeepSeek 结果仍为数字。
+- AnySearch 的非缓存请求显示 `cost unknown`，不产生虚构的 CNY 服务费用记录；这不代表免费，以服务商账户为准。缓存命中不再发出网络请求。当前进程的默认 300 次本地限额统计成功非空请求，不代表服务端余额或精确计费次数。
+- 所有 AnySearch 错误响应均不显示原文，防止额度耗尽响应携带生成的账号或密钥；失败只显示 HTTP 状态等安全诊断。请求禁止自动跟随重定向，防止凭据被转发。
+- 修改配置后执行 `/reload` 或重启 Pi；`/websearch status` 显示当前渠道。不要在 issue、日志或版本库中附上个人配置文件。
+
+渠道内部使用独立适配器，共享缓存、限额与 HTTP 生命周期；新增渠道无需继续在客户端堆叠条件分支。开发边界及接入步骤见 [Provider 适配器架构](search-providers.md)。目前仅实现 DeepSeek 与 AnySearch，不接受尚未实现的 Tavily、Exa 配置值。
+
+### AnySearch 邮箱获取密钥
+
+官方 [AnySearch Skill README](https://github.com/anysearch-ai/anysearch-skill#register-for-an-api-key-recommended) 提供邮箱注册取钥流程：向 `https://api.anysearch.com/v1/auth/email/register` 发送 `{"email":"真实可接收邮件的邮箱"}`，成功时从 `data.api_key.key` 获取一次性明文密钥。该流程是注册新账号，不是凭任意邮箱登录已有账号；`email_already_registered` 时应前往返回的登录地址自行登录，不重复注册。
+
+这是向第三方发送邮箱并创建账号的操作，必须由用户明确同意。推荐通过 `/websearch setup` 的邮箱注册向导完成；本扩展不会在搜索或启动时擅自注册、登录或保存新密钥。可在官方控制台 https://anysearch.com/console/api-keys 获取密钥，再安全写入个人配置的 `anysearch_api_key`。邮箱已注册、注册失败或额度不足不会触发批量注册或自动换号。获取密钥的门槛与每次调用费用是两回事，具体成本以官方套餐及账户额度为准。
+
+官方接口文档：[Search](https://anysearch.com/docs/api-endpoints/v1-search)、[Extract](https://anysearch.com/docs/api-endpoints/v1-extract)。
+
 ## write-transforms
 
 文件：[`extensions/write-transforms.ts`](../extensions/write-transforms.ts)
@@ -165,5 +213,5 @@ api_key=填写你自己的密钥
 - 生成摘要时，当前会话内容可能被发送给活动模型，请根据模型服务的隐私策略使用；裸 `/n` 同理。
 - `notify-dot` 的前台探测仅在 Windows Terminal 下生效，其他终端依赖焦点报告（如支持）与按键启发式；标记在用户离开时提示，收到返回标签的焦点报告即可清除，未收到报告时仍可通过输入清除。
 - `permission-gate` 是启发式策略而非沙箱：动态拼接、混淆或未覆盖的危险命令不保证被拦；白名单按命令哈希匹配，参数变化即视为新命令。
-- `web-search` 依赖 DeepSeek Search API 并按成功次数计费；查询内容由模型构造并发送给该服务，请按隐私策略使用。限额与凭据见 [web-search](#web-search)。
+- `web-search` 按配置调用 DeepSeek Search API 或 AnySearch，费用规则以对应服务商为准；查询内容由模型构造并发送给该服务，请按隐私策略使用。限额与凭据见 [web-search](#web-search)。
 - 规则文件中的扩展清单来自作者本机环境；如果只安装本仓库的十个扩展，应按实际安装情况维护清单。

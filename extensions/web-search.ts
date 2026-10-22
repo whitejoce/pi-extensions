@@ -1,5 +1,5 @@
 /**
- * web-search: DeepSeek Search/Fetch tools for pi.
+ * web-search: DeepSeek or AnySearch Search/Fetch tools for pi.
  *
  * Registers two read-only tools and a /websearch command family:
  *   - web_search(query, count?) — ranked results with model-facing summaries;
@@ -8,12 +8,12 @@
  *   - web_fetch(url, offset?) — paged Markdown of one page.
  *   - /websearch <query> — direct search overlay (no model round-trip)
  *   - /websearch fetch <n|url> — fetch the n-th result of the last /websearch
- *   - /websearch status — billed calls, cache hits, estimated cost
+ *   - /websearch status — provider, nonempty calls, cache hits, estimated cost
  *
  * Session-scoped TTL cache dedupes exact repeats for free; billing counters are
- * per process (5 CNY / 1000 successful calls). The process-local daily quota
+ * per process (DeepSeek: 5 CNY / 1000 successful calls; AnySearch: price unknown). The process-local daily quota
  * resets on the local calendar date; restarts reset it too. Credentials come from
- * personal config, legacy web-search/.env, then Pi's deepseek API-key credential (see client.ts).
+ * personal config or legacy web-search/.env; only DeepSeek falls back to Pi's credential (see client.ts).
  */
 import { Type } from "@earendil-works/pi-ai";
 import type { Component } from "@earendil-works/pi-tui";
@@ -25,8 +25,9 @@ import {
   type Theme,
   type ToolRenderResultOptions,
 } from "@earendil-works/pi-coding-agent";
-import { ApiError, LimitError, PRICE_PER_CALL_CNY, SearchClient, type FetchResult, type SearchDetails } from "./web-search/client.js";
+import { ApiError, LimitError, SearchClient, type FetchResult, type SearchDetails } from "./web-search/client.js";
 import { commandRequest, showOverlay } from "./web-search/command-ui.js";
+import { SearchSettings } from "./web-search/settings.js";
 import { recordExpense } from "./shared/billing.js";
 import {
   buildFetchLines,
@@ -67,21 +68,34 @@ type FetchErrDetails = { url: string; error: string };
 type SearchToolDetails = SearchDetails | SearchErrDetails;
 type FetchToolDetails = FetchDetails | FetchErrDetails;
 
-export default function webSearch(pi: ExtensionAPI, client = new SearchClient()) {
+export default function webSearch(pi: ExtensionAPI, client = new SearchClient(), settings = new SearchSettings()) {
   let lifecycle = new AbortController();
   let lastSearch: SearchDetails | null = null;
   let context: ExtensionContext | undefined;
   let ledgerError = false;
-  const subscribe = () => client.onCharge(charge => {
+  let settingsBusy = false;
+  const subscribe = () => {
+    const sourceClient = client;
+    return sourceClient.onCharge(charge => {
     try {
       recordExpense(pi, { id: charge.id, source: "web-search", kind: charge.kind,
-        amount: charge.amountCny, currency: "CNY", provider: "deepseek", model: "web-service" });
+        amount: charge.amountCny, currency: "CNY", provider: sourceClient.provider, model: "web-service" });
     } catch {
       ledgerError = true;
       context?.ui.notify("web-search 费用写入失败，本次会话的费用统计可能不完整", "warning");
     }
-  });
+    });
+  };
   let unsubscribe: (() => void) | undefined = subscribe();
+  const applyClient = (next: SearchClient) => {
+    lifecycle.abort();
+    lifecycle = new AbortController();
+    unsubscribe?.();
+    client = next;
+    lastSearch = null;
+    ledgerError = false;
+    unsubscribe = subscribe();
+  };
   pi.on("session_start", (_event, ctx) => {
     lifecycle.abort();
     lifecycle = new AbortController();
@@ -100,11 +114,11 @@ export default function webSearch(pi: ExtensionAPI, client = new SearchClient())
       label: "Web Search",
       description:
         "Search the web and return ranked results with summaries. Supports site:, -site:, \"exact phrase\", | (OR) and .. (range) syntax. " +
-        "Each result carries rerank_score (0-3, >=1.5 high quality) and authority (0-4, >=3 highly authoritative). " +
-        "Call web_fetch(url) when you need the full page.",
+        "DeepSeek results carry rerank_score (0-3, >=1.5 high quality) and authority (0-4, >=3 highly authoritative). " +
+        "AnySearch does not provide these scores (null). Call web_fetch(url) when you need the full page.",
       promptSnippet: "web search with ranked results and page fetch",
       promptGuidelines: [
-        "Prefer web_search for time-sensitive or unverifiable facts instead of guessing; results include per-source authority scores.",
+        "Prefer web_search for time-sensitive or unverifiable facts instead of guessing; only DeepSeek results include per-source authority scores; null means unavailable, not low quality.",
       ],
       annotations: { readOnlyHint: true, openWorldHint: true },
       parameters: Type.Object({
@@ -117,8 +131,8 @@ export default function webSearch(pi: ExtensionAPI, client = new SearchClient())
         cached: Type.Boolean(),
         results: Type.Array(
           Type.Object({
-            rerank_score: Type.Number(),
-            authority: Type.Integer(),
+            rerank_score: Type.Union([Type.Number(), Type.Null()]),
+            authority: Type.Union([Type.Integer(), Type.Null()]),
             title: Type.String(),
             url: Type.String(),
             snippet: Type.String(),
@@ -208,7 +222,7 @@ export default function webSearch(pi: ExtensionAPI, client = new SearchClient())
         const active = requestSignal(signal);
         try {
           const offset = params.offset ?? 0;
-          const page: FetchResult & { costCny: number } = await client.fetchPage(params.url, active);
+          const page: FetchResult & { costCny: number | null } = await client.fetchPage(params.url, active);
           active.throwIfAborted();
           const length = params.length ?? FETCH_PAGE_CHARS;
           const text = fetchContent(page, params.url, offset, length);
@@ -261,20 +275,46 @@ export default function webSearch(pi: ExtensionAPI, client = new SearchClient())
   /* ---------- /websearch command family ---------- */
 
   pi.registerCommand("websearch", {
-    description: "DeepSeek web search: /websearch <query> | /websearch fetch <n|url> | /websearch status",
+    description: "Web search: /websearch setup | provider [auto|deepseek|anysearch] | status | <query> | fetch <n|url>",
     handler: async (args, ctx) => {
       context = ctx;
       const active = lifecycle.signal;
       const argv = args.trim().split(/\s+/).filter(Boolean);
 
+      if (argv[0] === "help") {
+        ctx.ui.notify("/websearch：开始使用或测试连接\n/websearch <关键词>：搜索\n/websearch provider：高级渠道选择\n/websearch status：简洁状态\n/websearch status --verbose：诊断详情\n帮助不会发起网络请求。", "info");
+        return;
+      }
+      if (argv[0] === "setup" || argv[0] === "provider" || (!argv.length && ctx.mode === "tui")) {
+        if (argv.length > (argv[0] === "setup" ? 1 : 2)) {
+          ctx.ui.notify("用法：/websearch setup 或 /websearch provider [auto|deepseek|anysearch]；不要把密钥粘贴到命令中", "error");
+          return;
+        }
+        if (settingsBusy) { ctx.ui.notify("搜索设置已打开，请先完成或取消当前操作", "warning"); return; }
+        settingsBusy = true;
+        let signal = ctx.signal ? AbortSignal.any([active, ctx.signal]) : active;
+        try {
+          if (ctx.mode === "tui" && argv[0] !== "provider") {
+            await settings.home(ctx, () => client, () => signal, next => {
+              applyClient(next);
+              signal = requestSignal(ctx.signal);
+            });
+          } else await settings.command(argv[0] as "setup" | "provider", argv[1], ctx, signal, client, applyClient);
+        }
+        catch (error) {
+          if (!signal.aborted) ctx.ui.notify(errorMessage(error), "error");
+        } finally { settingsBusy = false; }
+        return;
+      }
+
       if (argv.length === 0 || argv[0] === "status") {
         const s = client.stats();
-        ctx.ui.notify(
-          `web-search · calls ${s.billed} (cache ${s.cacheHits}) · est ¥${(s.billed * PRICE_PER_CALL_CNY).toFixed(3)}` +
-            ` · today ${s.day}: ${s.dailyBilled}/${s.dailyLimit || "off"} (+${s.dailyPending} pending; quota resets on restart)` +
-            (s.lastError ? ` · ${s.lastError}` : "") + (ledgerError ? " · 费用记录失败，统计可能不完整" : ""),
-          "info",
-        );
+        const details = argv[1] === "--verbose";
+        ctx.ui.notify(settings.summary(client) + (details
+          ? `\n调用：${s.billed}；缓存命中：${s.cacheHits}；重试：${s.retries}` +
+            `\n本进程今日调用：${s.dailyBilled}/${s.dailyLimit || "不限"}（非服务商余额）` +
+            (s.estimatedCostCny === null ? "\n费用：未知，以服务商账户为准" : `\n预估费用：¥${s.estimatedCostCny.toFixed(3)}`) +
+            (s.lastError ? `\n最近错误：${s.lastError}` : "") + (ledgerError ? "\n费用记录失败" : "") : ""), "info");
         return;
       }
 

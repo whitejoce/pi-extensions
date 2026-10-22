@@ -1,9 +1,13 @@
 param(
-    [Parameter(Mandatory)][string]$PiPackageDir
+    [Parameter(Mandatory)][string]$PiPackageDir,
+    [string]$TypeScriptPath
 )
 $ErrorActionPreference = 'Stop'
 $PiPackageDir = (Resolve-Path -LiteralPath $PiPackageDir).Path
 $nodeModules = Split-Path (Split-Path $PiPackageDir -Parent) -Parent
+if (-not (Test-Path -LiteralPath (Join-Path $nodeModules 'jiti'))) {
+    $nodeModules = Join-Path $PiPackageDir 'node_modules'
+}
 $repository = Split-Path $PSScriptRoot -Parent
 if (-not (Test-Path -LiteralPath (Join-Path $PiPackageDir 'dist/index.js'))) {
     throw 'PiPackageDir must point to an installed @earendil-works/pi-coding-agent package'
@@ -30,10 +34,13 @@ $runner = '(async()=>{const {pathToFileURL}=require("node:url");const {createReq
 
 try {
     $config | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $validationConfig -Encoding utf8
-    tsc -p $validationConfig
+    if ($TypeScriptPath) { node $TypeScriptPath -p $validationConfig }
+    else { tsc -p $validationConfig }
     if ($LASTEXITCODE -ne 0) { throw 'TypeScript check failed' }
     foreach ($test in @(
-        'extensions/web-search/config.test.ts', 'tests/package.test.ts',
+        'extensions/web-search/config.test.ts', 'extensions/web-search/providers.test.ts',
+        'extensions/web-search/adapters.test.ts', 'extensions/web-search/registration.test.ts',
+        'extensions/web-search/settings.test.ts', 'tests/package.test.ts',
         'extensions/permission-gate/policy.test.ts', 'extensions/permission-gate/elevation.test.ts',
         'extensions/permission-gate/authorization.test.ts', 'extensions/permission-gate/lifecycle.test.ts',
         'extensions/permission-gate/approval.test.ts', 'extensions/permission-gate/dialog.test.ts',
